@@ -1,0 +1,438 @@
+{
+  "name": "Weather Alert Bot - Multi Location",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        0
+      ],
+      "id": "f8e06d09-8bfd-4705-90ac-e5601d321777",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "=latitude",
+              "value": "={{ $json.latitude }}"
+            },
+            {
+              "name": "=longitude",
+              "value": "={{ $json.longitude }}"
+            },
+            {
+              "name": "current",
+              "value": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,rain"
+            },
+            {
+              "name": "hourly",
+              "value": "temperature_2m,precipitation_probability,precipitation"
+            },
+            {
+              "name": "timezone",
+              "value": "Asia/Bangkok"
+            },
+            {
+              "name": "forecast_days",
+              "value": "1"
+            },
+            {
+              "name": "daily",
+              "value": "temperature_2m_max,temperature_2m_min,apparent_temperature_max"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        304,
+        -64
+      ],
+      "id": "c0b8fa58-b806-4895-83c4-61c9523473cf",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/*\n * Analyze Rain Risk - V2\n * Weather Alert Bot - Multi Location\n *\n * Business Rules:\n * NONE     = 0%\n * LOW      = 1-29%\n * MODERATE = 30-59%\n * WATCH    = 60-69%\n * HIGH     = 70-100%\n *\n * Important:\n * riskHours contains WATCH and HIGH only.\n * MODERATE is stored separately for Daily Summary.\n */\n\n// ==========================================\n// 1. Get Input\n// ==========================================\n\nconst items = $input.all();\n\nif (items.length === 0) {\n  throw new Error(\"No weather data received\");\n}\n\n// ==========================================\n// 2. Define Risk Thresholds\n// ==========================================\n\nconst MODERATE_THRESHOLD = 30;\nconst WATCH_THRESHOLD = 60;\nconst HIGH_THRESHOLD = 70;\n\n// ==========================================\n// 3. Classify Rain Probability\n// ==========================================\n\nfunction classifyRisk(probability) {\n\n  if (probability === 0) {\n    return \"NONE\";\n  }\n\n  if (probability < MODERATE_THRESHOLD) {\n    return \"LOW\";\n  }\n\n  if (probability < WATCH_THRESHOLD) {\n    return \"MODERATE\";\n  }\n\n  if (probability < HIGH_THRESHOLD) {\n    return \"WATCH\";\n  }\n\n  return \"HIGH\";\n}\n\n// ==========================================\n// 4. Process Each Location\n// ==========================================\n\nreturn items.map((item, index) => {\n\n  const data = item.json;\n\n  // ----------------------------------------\n  // 4.1 Validate Location\n  // ----------------------------------------\n\n  if (!data.locationId || !data.locationName) {\n    throw new Error(\n      `Missing location information at item ${index}`\n    );\n  }\n\n  // ----------------------------------------\n  // 4.2 Validate Forecast\n  // ----------------------------------------\n\n  if (\n    !Array.isArray(data.forecast) ||\n    data.forecast.length === 0\n  ) {\n    throw new Error(\n      `Missing forecast data for ${data.locationName}`\n    );\n  }\n\n  // ----------------------------------------\n  // 4.3 Classify Every Forecast Hour\n  // ----------------------------------------\n\n  const classifiedForecast = data.forecast.map(hour => {\n\n    if (\n      !hour.time ||\n      hour.rainProbability === null ||\n      hour.rainProbability === undefined ||\n      !Number.isFinite(Number(hour.rainProbability))\n    ) {\n      throw new Error(\n        `Invalid rain probability for ${data.locationName}`\n      );\n    }\n\n    const probability = Number(hour.rainProbability);\n\n    if (probability < 0 || probability > 100) {\n      throw new Error(\n        `Rain probability out of range for ${data.locationName}`\n      );\n    }\n\n    return {\n      ...hour,\n      rainProbability: probability,\n      riskLevel: classifyRisk(probability)\n    };\n\n  });\n\n  // ========================================\n  // 5. Separate Rain Risk Levels\n  // ========================================\n\n  const noneHours = classifiedForecast.filter(\n    hour => hour.riskLevel === \"NONE\"\n  );\n\n  const lowHours = classifiedForecast.filter(\n    hour => hour.riskLevel === \"LOW\"\n  );\n\n  const moderateHours = classifiedForecast.filter(\n    hour => hour.riskLevel === \"MODERATE\"\n  );\n\n  const watchHours = classifiedForecast.filter(\n    hour => hour.riskLevel === \"WATCH\"\n  );\n\n  const highRiskHours = classifiedForecast.filter(\n    hour => hour.riskLevel === \"HIGH\"\n  );\n\n  // ========================================\n  // 6. Prepare Alert-Level Risk Hours\n  // ========================================\n\n  // Only WATCH and HIGH are included.\n  // These hours will be passed to Time Grouping.\n\n  const riskHours = classifiedForecast.filter(\n    hour =>\n      hour.riskLevel === \"WATCH\" ||\n      hour.riskLevel === \"HIGH\"\n  );\n\n  // ========================================\n  // 7. Calculate Maximum Rain Probability\n  // ========================================\n\n  const maxRainProbability = Math.max(\n    ...classifiedForecast.map(\n      hour => hour.rainProbability\n    )\n  );\n\n  // Highest rainfall probability of the day\n  const overallRainStatus = classifyRisk(\n    maxRainProbability\n  );\n\n  // ========================================\n  // 8. Return Results\n  // ========================================\n\n  return {\n    json: {\n      ...data,\n\n      // Risk thresholds\n      noneThreshold: 0,\n      moderateThreshold: MODERATE_THRESHOLD,\n      watchThreshold: WATCH_THRESHOLD,\n      highThreshold: HIGH_THRESHOLD,\n\n      // Overall daily rain status\n      maxRainProbability,\n      overallRainStatus,\n\n      // Rain potential and alert flags\n      hasRainPotential:\n        maxRainProbability >= MODERATE_THRESHOLD,\n\n      hasModerateRainChance:\n        moderateHours.length > 0,\n\n      hasRainRisk:\n        riskHours.length > 0,\n\n      // Hour counts by risk level\n      noneHoursCount: noneHours.length,\n      lowHoursCount: lowHours.length,\n      moderateHoursCount: moderateHours.length,\n      watchHoursCount: watchHours.length,\n      highRiskHoursCount: highRiskHours.length,\n\n      // Preserve old field names for downstream nodes\n      rainyHoursCount: riskHours.length,\n      riskHoursCount: riskHours.length,\n\n      // Classified forecast\n      classifiedForecast,\n\n      // Separate risk groups\n      noneHours,\n      lowHours,\n      moderateHours,\n      watchHours,\n      highRiskHours,\n\n      // Used by Time Grouping\n      riskHours\n    }\n  };\n\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        16
+      ],
+      "id": "ae761377-b101-4cbf-8012-358d6306a6a5",
+      "name": "Analyze Rain Risk"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// รวมชั่วโมงที่มีความเสี่ยงฝน แยกตามพื้นที่และระดับความเสี่ยง\n\nconst items = $input.all();\n\n// ประมวลผลแต่ละพื้นที่แยกจากกัน\nreturn items.map(item => {\n  const data = item.json;\n\n  // ตรวจสอบข้อมูล Risk Hours\n  const hours = Array.isArray(data.riskHours)\n    ? [...data.riskHours].sort(\n        (a, b) => a.time.localeCompare(b.time)\n      )\n    : [];\n\n  const groups = [];\n  let currentGroup = null;\n\n  for (const hour of hours) {\n    // แปลงเวลาเป็น Timestamp ตาม UTC+7\n    const startMs = new Date(\n      `${hour.time}:00+07:00`\n    ).getTime();\n\n    if (!Number.isFinite(startMs)) {\n      continue;\n    }\n\n    const endMs = startMs + 60 * 60 * 1000;\n\n    const probability = Number(hour.rainProbability);\n    const precipitation = Number(hour.precipitation ?? 0);\n\n    // ตรวจสอบว่าชั่วโมงใหม่ต่อเนื่องกับกลุ่มเดิมหรือไม่\n    const canMerge =\n      currentGroup !== null &&\n      currentGroup.riskLevel === hour.riskLevel &&\n      currentGroup.endMs === startMs;\n\n    if (canMerge) {\n      currentGroup.endMs = endMs;\n\n      currentGroup.maxProbability = Math.max(\n        currentGroup.maxProbability,\n        probability\n      );\n\n      currentGroup.minProbability = Math.min(\n        currentGroup.minProbability,\n        probability\n      );\n\n      currentGroup.hoursCount++;\n      currentGroup.totalPrecipitation += precipitation;\n\n    } else {\n      currentGroup = {\n        riskLevel: hour.riskLevel,\n        startMs,\n        endMs,\n        minProbability: probability,\n        maxProbability: probability,\n        hoursCount: 1,\n        totalPrecipitation: precipitation\n      };\n\n      groups.push(currentGroup);\n    }\n  }\n\n  // แปลงเวลาเป็น HH:mm ตามเวลาไทย\n  function formatTime(ms) {\n    return new Intl.DateTimeFormat(\"en-GB\", {\n      timeZone: \"Asia/Bangkok\",\n      hour: \"2-digit\",\n      minute: \"2-digit\",\n      hourCycle: \"h23\"\n    }).format(new Date(ms));\n  }\n\n  // สร้างช่วงเวลาเสี่ยงฝน\n  const riskPeriods = groups.map(group => ({\n    riskLevel: group.riskLevel,\n    startTime: formatTime(group.startMs),\n    endTime: formatTime(group.endMs),\n\n    minProbability: group.minProbability,\n    maxProbability: group.maxProbability,\n\n    hoursCount: group.hoursCount,\n\n    totalPrecipitation: Number(\n      group.totalPrecipitation.toFixed(1)\n    )\n  }));\n\n  // ส่งข้อมูลเดิมทั้งหมดพร้อมผล Time Grouping\n  return {\n    json: {\n      ...data,\n\n      totalPeriods: riskPeriods.length,\n      riskPeriods\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        64
+      ],
+      "id": "7d64e124-07ba-4095-b846-5a9b99d642a9",
+      "name": "Time Grouping"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// วิเคราะห์ช่วงเวลาที่คาดว่าจะมีปริมาณฝน แยกตามพื้นที่\n\nconst items = $input.all();\n\nreturn items.map(item => {\n  const data = item.json;\n\n  // อ่านข้อมูลพยากรณ์ของพื้นที่ปัจจุบัน\n  const forecast = Array.isArray(data.forecast)\n    ? data.forecast\n    : [];\n\n  // เลือกเฉพาะชั่วโมงที่คาดว่าจะมีปริมาณฝนมากกว่า 0 mm\n  const rainyHours = forecast\n    .filter(hour =>\n      hour.time &&\n      Number.isFinite(Number(hour.precipitation)) &&\n      Number(hour.precipitation) > 0\n    )\n    .sort((a, b) => a.time.localeCompare(b.time));\n\n  const rainfallPeriods = [];\n  let currentPeriod = null;\n\n  for (const hour of rainyHours) {\n    const startMs = new Date(\n      `${hour.time}:00+07:00`\n    ).getTime();\n\n    if (!Number.isFinite(startMs)) {\n      continue;\n    }\n\n    const endMs = startMs + 60 * 60 * 1000;\n    const precipitation = Number(hour.precipitation);\n\n    // รวมเฉพาะชั่วโมงที่ต่อเนื่องกัน\n    const canMerge =\n      currentPeriod !== null &&\n      currentPeriod.endMs === startMs;\n\n    if (canMerge) {\n      currentPeriod.endMs = endMs;\n      currentPeriod.hoursCount++;\n      currentPeriod.totalPrecipitation += precipitation;\n    } else {\n      currentPeriod = {\n        startMs,\n        endMs,\n        hoursCount: 1,\n        totalPrecipitation: precipitation\n      };\n\n      rainfallPeriods.push(currentPeriod);\n    }\n  }\n\n  // แปลงเวลาเป็น HH:mm ตามเวลาไทย\n  function formatTime(ms) {\n    return new Intl.DateTimeFormat(\"en-GB\", {\n      timeZone: \"Asia/Bangkok\",\n      hour: \"2-digit\",\n      minute: \"2-digit\",\n      hourCycle: \"h23\"\n    }).format(new Date(ms));\n  }\n\n  // สรุปช่วงเวลาที่คาดว่าจะมีฝน\n  const periods = rainfallPeriods.map(period => ({\n    startTime: formatTime(period.startMs),\n    endTime: formatTime(period.endMs),\n    hoursCount: period.hoursCount,\n    totalPrecipitation: Number(\n      period.totalPrecipitation.toFixed(1)\n    )\n  }));\n\n  // รักษาข้อมูลเดิมและเพิ่มผล Rainfall Analysis\n  return {\n    json: {\n      ...data,\n      totalRainfallPeriods: periods.length,\n      rainfallPeriods: periods\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        64
+      ],
+      "id": "4cf98024-2ef3-4252-a80e-fa1e235b5762",
+      "name": "Rainfall Analysis"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/*\n * Filter Upcoming Periods\n * Weather Alert Bot - Multi Location\n *\n * Purpose:\n * 1. Filter past forecast hours.\n * 2. Keep current and future forecast hours.\n * 3. Filter expired risk periods.\n * 4. Filter expired rainfall periods.\n * 5. Filter expired moderate hours.\n * 6. Preserve all original data.\n *\n * Timezone: Asia/Bangkok\n */\n\n// ==========================================\n// 1. Get Input\n// ==========================================\n\nconst items = $input.all();\n\nif (items.length === 0) {\n  throw new Error(\"No location data received\");\n}\n\n// Current time\nconst now = new Date();\nconst nowMs = now.getTime();\n\n// ==========================================\n// 2. Get Thailand Date and Time\n// ==========================================\n\nconst thaiDate = new Intl.DateTimeFormat(\"en-CA\", {\n  timeZone: \"Asia/Bangkok\",\n  year: \"numeric\",\n  month: \"2-digit\",\n  day: \"2-digit\"\n}).format(now);\n\nconst thaiTime = new Intl.DateTimeFormat(\"en-GB\", {\n  timeZone: \"Asia/Bangkok\",\n  hour: \"2-digit\",\n  minute: \"2-digit\",\n  hourCycle: \"h23\"\n}).format(now);\n\n// ==========================================\n// 3. Time Conversion Functions\n// ==========================================\n\n// Convert Thailand date and HH:mm to timestamp\nfunction toBangkokTimestamp(date, time) {\n\n  if (\n    typeof date !== \"string\" ||\n    !/^\\d{4}-\\d{2}-\\d{2}$/.test(date) ||\n    typeof time !== \"string\" ||\n    !/^([01]\\d|2[0-3]):[0-5]\\d$/.test(time)\n  ) {\n    return NaN;\n  }\n\n  return new Date(\n    `${date}T${time}:00+07:00`\n  ).getTime();\n}\n\n// Convert forecast ISO time to timestamp\nfunction toForecastTimestamp(time) {\n\n  if (\n    typeof time !== \"string\" ||\n    !/^\\d{4}-\\d{2}-\\d{2}T([01]\\d|2[0-3]):[0-5]\\d$/.test(time)\n  ) {\n    return NaN;\n  }\n\n  return new Date(\n    `${time}:00+07:00`\n  ).getTime();\n}\n\n// ==========================================\n// 4. Filter Upcoming Periods\n// ==========================================\n\nfunction filterUpcoming(periods, date, locationName, fieldName) {\n\n  if (!Array.isArray(periods)) {\n    throw new Error(\n      `Invalid ${fieldName} for ${locationName}`\n    );\n  }\n\n  return periods\n    .map(period => {\n\n      if (!period || !period.startTime || !period.endTime) {\n        throw new Error(\n          `Invalid period data in ${fieldName} for ${locationName}`\n        );\n      }\n\n      const startMs = toBangkokTimestamp(\n        date,\n        period.startTime\n      );\n\n      let endMs = toBangkokTimestamp(\n        date,\n        period.endTime\n      );\n\n      if (\n        !Number.isFinite(startMs) ||\n        !Number.isFinite(endMs)\n      ) {\n        throw new Error(\n          `Invalid period time in ${fieldName} for ${locationName}`\n        );\n      }\n\n      // Support periods ending after midnight\n      if (endMs <= startMs) {\n        endMs += 24 * 60 * 60 * 1000;\n      }\n\n      const isOngoing =\n        startMs <= nowMs &&\n        endMs > nowMs;\n\n      return {\n        ...period,\n\n        displayStartTime: isOngoing\n          ? thaiTime\n          : period.startTime,\n\n        isOngoing,\n\n        _endMs: endMs\n      };\n\n    })\n\n    // Keep only periods that have not ended\n    .filter(period => period._endMs > nowMs)\n\n    // Remove internal timestamp\n    .map(({ _endMs, ...period }) => period);\n}\n\n// ==========================================\n// 5. Filter Upcoming Moderate Hours\n// ==========================================\n\nfunction filterUpcomingModerate(hours, locationName) {\n\n  if (!Array.isArray(hours)) {\n    throw new Error(\n      `Invalid moderateHours for ${locationName}`\n    );\n  }\n\n  return hours.filter(hour => {\n\n    if (!hour || !hour.time) {\n      throw new Error(\n        `Invalid moderate hour for ${locationName}`\n      );\n    }\n\n    const startMs = toForecastTimestamp(hour.time);\n\n    if (!Number.isFinite(startMs)) {\n      throw new Error(\n        `Invalid moderate forecast time for ${locationName}`\n      );\n    }\n\n    const endMs =\n      startMs + 60 * 60 * 1000;\n\n    // Keep current and future hours\n    return endMs > nowMs;\n\n  });\n}\n\n// ==========================================\n// 6. Process Each Location\n// ==========================================\n\nreturn items.map((item, index) => {\n\n  const data = item.json;\n\n  const locationName =\n    data.locationName || `Location ${index + 1}`;\n\n  // ----------------------------------------\n  // 6.1 Validate Location Data\n  // ----------------------------------------\n\n  if (!data.locationId || !data.locationName) {\n    throw new Error(\n      `Missing location information at item ${index}`\n    );\n  }\n\n  if (\n    typeof data.date !== \"string\" ||\n    !/^\\d{4}-\\d{2}-\\d{2}$/.test(data.date)\n  ) {\n    throw new Error(\n      `Invalid forecast date for ${locationName}`\n    );\n  }\n\n  // ----------------------------------------\n  // 6.2 Validate Forecast\n  // ----------------------------------------\n\n  if (!Array.isArray(data.forecast)) {\n    throw new Error(\n      `Invalid forecast data for ${locationName}`\n    );\n  }\n\n  // ----------------------------------------\n  // 6.3 Filter Upcoming Forecast\n  // ----------------------------------------\n\n  const upcomingForecast = data.forecast.filter(hour => {\n\n    if (!hour || !hour.time) {\n      throw new Error(\n        `Invalid forecast hour for ${locationName}`\n      );\n    }\n\n    const forecastStartMs = toForecastTimestamp(\n      hour.time\n    );\n\n    if (!Number.isFinite(forecastStartMs)) {\n      throw new Error(\n        `Invalid forecast timestamp for ${locationName}`\n      );\n    }\n\n    const forecastEndMs =\n      forecastStartMs + 60 * 60 * 1000;\n\n    // Keep current and future forecast hours\n    return forecastEndMs > nowMs;\n\n  });\n\n  // ----------------------------------------\n  // 6.4 Filter Upcoming Risk Periods\n  // ----------------------------------------\n\n  const upcomingRiskPeriods = filterUpcoming(\n    data.riskPeriods,\n    data.date,\n    locationName,\n    \"riskPeriods\"\n  );\n\n  // ----------------------------------------\n  // 6.5 Filter Upcoming Rainfall Periods\n  // ----------------------------------------\n\n  const upcomingRainfallPeriods = filterUpcoming(\n    data.rainfallPeriods,\n    data.date,\n    locationName,\n    \"rainfallPeriods\"\n  );\n\n  // ----------------------------------------\n  // 6.6 Filter Upcoming Moderate Hours\n  // ----------------------------------------\n\n  const upcomingModerateHours = filterUpcomingModerate(\n    data.moderateHours,\n    locationName\n  );\n\n  // ----------------------------------------\n  // 6.7 Calculate Upcoming Status\n  // ----------------------------------------\n\n  const hasUpcomingRainRisk =\n    upcomingRiskPeriods.length > 0;\n\n  const hasUpcomingModerateChance =\n    upcomingModerateHours.length > 0;\n\n  // Show rain alert section only for WATCH/HIGH\n  const showRainSection =\n    hasUpcomingRainRisk;\n\n  // ========================================\n  // 7. Return Processed Data\n  // ========================================\n\n  return {\n    json: {\n\n      // Preserve all original data\n      ...data,\n\n      // Processing timestamp\n      processedAt: `${thaiDate}T${thaiTime}`,\n\n      // Upcoming forecast\n      upcomingForecast,\n\n      // Upcoming risk periods (WATCH/HIGH)\n      upcomingRiskPeriods,\n\n      // Upcoming rainfall periods\n      upcomingRainfallPeriods,\n\n      // Upcoming moderate hours\n      upcomingModerateHours,\n\n      // Upcoming status\n      hasUpcomingRainRisk,\n      hasUpcomingModerateChance,\n\n      // Alert visibility\n      showRainSection\n\n    }\n  };\n\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        -80
+      ],
+      "id": "7edac45b-2377-46a3-9377-a5c180c5d185",
+      "name": "Filter Upcoming Periods"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/*\n * Daily Summary Message - Compact Pattern A FINAL\n * Weather Alert Bot - Multi Location\n *\n * Business Rules:\n * NONE     = 0%\n * LOW      = 1-29%\n * MODERATE = 30-59%\n * WATCH    = 60-69%\n * HIGH     = 70-100%\n *\n * Notification Policy:\n * - HIGH: Show risk period, probability and precipitation.\n * - WATCH: Show monitoring period, probability and precipitation.\n * - LOW / MODERATE: Brief summary only.\n * - NONE: Show no-rain-probability message.\n * - No separator lines between locations.\n * - One LINE message for all locations.\n */\n\n// ==========================================\n// 1. Configuration\n// ==========================================\n\nconst REQUIRED_LOCATIONS = [\"salaya\", \"nongkhaem\"];\n\nconst MODERATE_THRESHOLD = 30;\nconst WATCH_THRESHOLD = 60;\nconst HIGH_THRESHOLD = 70;\n\nconst locationOrder = {\n  salaya: 1,\n  nongkhaem: 2\n};\n\n// ==========================================\n// 2. Get and Validate Input\n// ==========================================\n\nconst items = $input.all();\n\nif (items.length === 0) {\n  throw new Error(\"No weather data received\");\n}\n\nconst locations = items\n  .map(item => item.json)\n  .sort((a, b) =>\n    (locationOrder[a.locationId] ?? 99) -\n    (locationOrder[b.locationId] ?? 99)\n  );\n\n// Validate location count\nif (locations.length !== REQUIRED_LOCATIONS.length) {\n  throw new Error(\n    `Expected ${REQUIRED_LOCATIONS.length} locations, received ${locations.length}`\n  );\n}\n\n// Validate required location IDs\nconst receivedIds = locations.map(\n  data => data.locationId\n);\n\nfor (const id of REQUIRED_LOCATIONS) {\n  if (!receivedIds.includes(id)) {\n    throw new Error(`Missing location: ${id}`);\n  }\n}\n\n// Prevent duplicate locations\nif (new Set(receivedIds).size !== receivedIds.length) {\n  throw new Error(\"Duplicate location detected\");\n}\n\n// ==========================================\n// 3. Validate Location Data\n// ==========================================\n\nfor (const data of locations) {\n\n  if (\n    !data.locationName ||\n    !data.date ||\n    !data.dailyAnalysis\n  ) {\n    throw new Error(\n      `Incomplete weather data for ${data.locationId}`\n    );\n  }\n\n  if (\n    !Array.isArray(data.upcomingForecast) ||\n    !Array.isArray(data.upcomingRiskPeriods) ||\n    !Array.isArray(data.upcomingModerateHours) ||\n    !Array.isArray(data.upcomingRainfallPeriods)\n  ) {\n    throw new Error(\n      `Missing forecast or rain analysis data for ${data.locationId}`\n    );\n  }\n}\n\n// Validate matching forecast dates\nconst dates = [\n  ...new Set(locations.map(data => data.date))\n];\n\nif (\n  dates.length !== 1 ||\n  !/^\\d{4}-\\d{2}-\\d{2}$/.test(dates[0])\n) {\n  throw new Error(\n    \"Forecast dates are invalid or do not match\"\n  );\n}\n\n// ==========================================\n// 4. Format Date and Numbers\n// ==========================================\n\nconst [year, month, day] = dates[0]\n  .split(\"-\")\n  .map(Number);\n\nconst monthNames = [\n  \"ม.ค.\", \"ก.พ.\", \"มี.ค.\", \"เม.ย.\",\n  \"พ.ค.\", \"มิ.ย.\", \"ก.ค.\", \"ส.ค.\",\n  \"ก.ย.\", \"ต.ค.\", \"พ.ย.\", \"ธ.ค.\"\n];\n\nif (\n  !Number.isInteger(year) ||\n  !Number.isInteger(month) ||\n  !Number.isInteger(day) ||\n  month < 1 ||\n  month > 12 ||\n  day < 1 ||\n  day > 31\n) {\n  throw new Error(\"Invalid forecast date\");\n}\n\nconst thaiDate =\n  `${day} ${monthNames[month - 1]} ${year + 543}`;\n\nfunction formatNumber(value) {\n\n  if (\n    value === null ||\n    value === undefined ||\n    value === \"\"\n  ) {\n    return \"ไม่ระบุ\";\n  }\n\n  const number = Number(value);\n\n  if (!Number.isFinite(number)) {\n    return \"ไม่ระบุ\";\n  }\n\n  return Number.isInteger(number)\n    ? String(number)\n    : number.toFixed(1);\n}\n\nfunction formatTemperature(value) {\n\n  const formatted = formatNumber(value);\n\n  return formatted === \"ไม่ระบุ\"\n    ? formatted\n    : `${formatted}°C`;\n}\n\n// ==========================================\n// 5. Rain Classification V2\n// ==========================================\n\nfunction classifyRainRisk(probability) {\n\n  if (probability === 0) {\n    return \"NONE\";\n  }\n\n  if (probability < MODERATE_THRESHOLD) {\n    return \"LOW\";\n  }\n\n  if (probability < WATCH_THRESHOLD) {\n    return \"MODERATE\";\n  }\n\n  if (probability < HIGH_THRESHOLD) {\n    return \"WATCH\";\n  }\n\n  return \"HIGH\";\n}\n\nconst statusMessages = {\n  NONE: \"ไม่พบโอกาสเกิดฝนจากแบบจำลอง\",\n  LOW: \"โอกาสเกิดฝนต่ำ\",\n  MODERATE: \"มีโอกาสเกิดฝนปานกลาง\"\n};\n\n// ==========================================\n// 6. Analyze Upcoming Rain Forecast\n// ==========================================\n\nfunction analyzeRainStatus(forecast, locationName) {\n\n  if (forecast.length === 0) {\n    return {\n      available: false,\n      maxProbability: null,\n      maxProbabilityTime: null,\n      riskLevel: null,\n      statusText: \"ไม่มีข้อมูลพยากรณ์ฝน\"\n    };\n  }\n\n  const validHours = forecast.map(hour => {\n\n    if (\n      !hour ||\n      typeof hour.time !== \"string\" ||\n      hour.rainProbability === null ||\n      hour.rainProbability === undefined\n    ) {\n      throw new Error(\n        `Invalid rainfall forecast for ${locationName}`\n      );\n    }\n\n    const probability = Number(\n      hour.rainProbability\n    );\n\n    if (\n      !Number.isFinite(probability) ||\n      probability < 0 ||\n      probability > 100\n    ) {\n      throw new Error(\n        `Invalid rain probability for ${locationName}`\n      );\n    }\n\n    return {\n      ...hour,\n      rainProbability: probability\n    };\n  });\n\n  // Find highest probability in remaining forecast\n  const maxHour = validHours.reduce((max, hour) =>\n    hour.rainProbability > max.rainProbability\n      ? hour\n      : max\n  );\n\n  const maxProbability = maxHour.rainProbability;\n\n  const riskLevel = classifyRainRisk(\n    maxProbability\n  );\n\n  return {\n    available: true,\n    maxProbability,\n    maxProbabilityTime: maxHour.time.slice(11, 16),\n    riskLevel,\n    statusText:\n      statusMessages[riskLevel] || riskLevel\n  };\n}\n\n// ==========================================\n// 7. Validate Risk Periods\n// ==========================================\n\nfunction prepareRiskPeriods(periods, locationName) {\n\n  if (!Array.isArray(periods)) {\n    throw new Error(\n      `Invalid risk periods for ${locationName}`\n    );\n  }\n\n  // Validate all periods before sorting\n  const validatedPeriods = periods.map(period => {\n\n    if (\n      !period ||\n      ![\"WATCH\", \"HIGH\"].includes(period.riskLevel) ||\n      !/^([01]\\d|2[0-3]):[0-5]\\d$/.test(period.startTime || \"\") ||\n      !/^([01]\\d|2[0-3]):[0-5]\\d$/.test(period.endTime || \"\")\n    ) {\n      throw new Error(\n        `Invalid risk period for ${locationName}`\n      );\n    }\n\n    const minProbability = Number(\n      period.minProbability\n    );\n\n    const maxProbability = Number(\n      period.maxProbability\n    );\n\n    if (\n      !Number.isFinite(minProbability) ||\n      !Number.isFinite(maxProbability) ||\n      minProbability < 0 ||\n      maxProbability > 100 ||\n      minProbability > maxProbability\n    ) {\n      throw new Error(\n        `Invalid probability range for ${locationName}`\n      );\n    }\n\n    // HIGH must be 70-100%\n    if (\n      period.riskLevel === \"HIGH\" &&\n      minProbability < HIGH_THRESHOLD\n    ) {\n      throw new Error(\n        `HIGH threshold mismatch for ${locationName}`\n      );\n    }\n\n    // WATCH must be 60-69%\n    if (\n      period.riskLevel === \"WATCH\" &&\n      (\n        minProbability < WATCH_THRESHOLD ||\n        maxProbability >= HIGH_THRESHOLD\n      )\n    ) {\n      throw new Error(\n        `WATCH threshold mismatch for ${locationName}`\n      );\n    }\n\n    // Validate accumulated precipitation\n    const precipitation =\n      period.totalPrecipitation === null ||\n      period.totalPrecipitation === undefined\n        ? null\n        : Number(period.totalPrecipitation);\n\n    if (\n      precipitation !== null &&\n      (\n        !Number.isFinite(precipitation) ||\n        precipitation < 0\n      )\n    ) {\n      throw new Error(\n        `Invalid precipitation for ${locationName}`\n      );\n    }\n\n    return {\n      ...period,\n      minProbability,\n      maxProbability,\n      totalPrecipitation: precipitation\n    };\n  });\n\n  return validatedPeriods.sort((a, b) =>\n    a.startTime.localeCompare(b.startTime)\n  );\n}\n\n// ==========================================\n// 8. Prepare Daily Summary\n// ==========================================\n\nconst lines = [\n  \"🌤️ Weather Alert — Daily Summary\",\n  `📅 ${thaiDate}`,\n  \"\"\n];\n\nconst locationResults = [];\n\nlet hasAnyRainRisk = false;\nlet hasCompleteRainForecast = true;\n\n// ==========================================\n// 9. Build Each Location Report\n// ==========================================\n\nfor (const data of locations) {\n\n  const daily = data.dailyAnalysis;\n  const locationName = data.locationName;\n\n  // ----------------------------------------\n  // 9.1 Analyze Remaining Rain Forecast\n  // ----------------------------------------\n\n  const rainStatus = analyzeRainStatus(\n    data.upcomingForecast,\n    locationName\n  );\n\n  if (!rainStatus.available) {\n    hasCompleteRainForecast = false;\n  }\n\n  // ----------------------------------------\n  // 9.2 Prepare WATCH / HIGH Periods\n  // ----------------------------------------\n\n  const riskPeriods = prepareRiskPeriods(\n    data.upcomingRiskPeriods,\n    locationName\n  );\n\n  const hasRainAlert =\n    riskPeriods.length > 0;\n\n  // ----------------------------------------\n  // 9.3 Cross-check Forecast and Risk Periods\n  // ----------------------------------------\n\n  if (rainStatus.available) {\n\n    const forecastHasRisk =\n      rainStatus.maxProbability >= WATCH_THRESHOLD;\n\n    if (forecastHasRisk !== hasRainAlert) {\n      throw new Error(\n        `Forecast and risk periods do not match for ${locationName}`\n      );\n    }\n\n  } else if (hasRainAlert) {\n\n    throw new Error(\n      `Risk periods exist but forecast is unavailable for ${locationName}`\n    );\n  }\n\n  // Validate upstream risk flag\n  if (\n    typeof data.hasUpcomingRainRisk === \"boolean\" &&\n    data.hasUpcomingRainRisk !== hasRainAlert\n  ) {\n    throw new Error(\n      `Upcoming rain risk flag mismatch for ${locationName}`\n    );\n  }\n\n  if (hasRainAlert) {\n    hasAnyRainRisk = true;\n  }\n\n  // ----------------------------------------\n  // 9.4 Location Heading\n  // ----------------------------------------\n\n  lines.push(\n    `📍 ${locationName}`\n  );\n\n  // ----------------------------------------\n  // 9.5 Temperature Summary\n  // ----------------------------------------\n\n  lines.push(\n    `🌡️ สูงสุด ${formatTemperature(daily.maxTemperature)} (${daily.maxTemperatureTime || \"ไม่ระบุ\"}) | ต่ำสุด ${formatTemperature(daily.minTemperature)} (${daily.minTemperatureTime || \"ไม่ระบุ\"})`,\n    `🥵 รู้สึกเหมือนสูงสุด ${formatTemperature(daily.maxFeelsLike)}`\n  );\n\n  lines.push(\"\");\n\n  // ----------------------------------------\n  // 9.6 LOW / MODERATE / NONE Summary\n  // ----------------------------------------\n\n  if (!rainStatus.available) {\n\n    lines.push(\n      \"⚪ ไม่มีข้อมูลพยากรณ์ฝนสำหรับช่วงเวลาที่เหลือ\"\n    );\n\n  } else if (rainStatus.riskLevel === \"HIGH\") {\n\n    // HIGH details displayed in risk period section.\n\n  } else if (rainStatus.riskLevel === \"WATCH\") {\n\n    // WATCH details displayed in risk period section.\n\n  } else if (rainStatus.riskLevel === \"MODERATE\") {\n\n    lines.push(\n      `🟡 ${statusMessages.MODERATE} (สูงสุด ${rainStatus.maxProbability}%)`\n    );\n\n  } else if (rainStatus.riskLevel === \"LOW\") {\n\n    lines.push(\n      `🟢 ${statusMessages.LOW} (สูงสุด ${rainStatus.maxProbability}%)`\n    );\n\n  } else {\n\n    lines.push(\n      `✅ ${statusMessages.NONE}`\n    );\n  }\n\n  // ----------------------------------------\n  // 9.7 Display HIGH / WATCH Periods\n  // ----------------------------------------\n\n  if (hasRainAlert) {\n\n    for (const period of riskPeriods) {\n\n      const start =\n        period.displayStartTime || period.startTime;\n\n      const end = period.endTime;\n\n      // Separate HIGH and WATCH wording\n      const periodHeading =\n        period.riskLevel === \"HIGH\"\n          ? `🔴 HIGH | ช่วงเสี่ยงฝนสูง: ${start}–${end} น.`\n          : `🟠 WATCH | ช่วงที่ควรเฝ้าระวังฝน: ${start}–${end} น.`;\n\n      // Risk level and specific time\n      lines.push(\n        \"\",\n        periodHeading\n      );\n\n      // Probability for this specific period\n      lines.push(\n        `โอกาสเกิดฝน: ${period.minProbability}–${period.maxProbability}%`\n      );\n\n      // Accumulated precipitation for this period\n      lines.push(\n        `ปริมาณฝนคาดการณ์สะสม: ${\n          period.totalPrecipitation === null\n            ? \"ไม่มีข้อมูล\"\n            : `${formatNumber(period.totalPrecipitation)} mm`\n        }`\n      );\n\n      // Currently ongoing period\n      if (period.isOngoing) {\n        lines.push(\n          \"ช่วงเวลาดังกล่าวกำลังดำเนินอยู่\"\n        );\n      }\n    }\n  }\n\n  // ----------------------------------------\n  // 9.8 Preserve Detailed Data for QA\n  // ----------------------------------------\n\n  locationResults.push({\n\n    locationId: data.locationId,\n    locationName,\n\n    dailyAnalysis: daily,\n\n    rainStatus,\n\n    hasUpcomingRainRisk: hasRainAlert,\n\n    upcomingRiskPeriods: riskPeriods,\n\n    upcomingModerateHours:\n      data.upcomingModerateHours,\n\n    upcomingRainfallPeriods:\n      data.upcomingRainfallPeriods,\n\n    moderateHoursCount:\n      data.upcomingModerateHours.length,\n\n    rainfallPeriodsCount:\n      data.upcomingRainfallPeriods.length\n  });\n\n  // Blank lines between locations\n  lines.push(\"\", \"\");\n}\n\n// ==========================================\n// 10. Overall Rain Risk Summary\n// ==========================================\n\nif (\n  !hasAnyRainRisk &&\n  hasCompleteRainForecast\n) {\n\n  lines.push(\n    \"✅ ไม่พบช่วงเวลาที่มีความเสี่ยงในการเกิดฝนทั้งสองพื้นที่\",\n    \"\"\n  );\n}\n\nif (hasAnyRainRisk) {\n\n  lines.push(\n    \"☂️ คำแนะนำ: ควรเตรียมร่มหรือเสื้อกันฝนก่อนเดินทาง\",\n    \"\"\n  );\n}\n\n// ==========================================\n// 11. Footer\n// ==========================================\n\nlines.push(\n  \"หมายเหตุ: โอกาสเกิดฝนเป็นค่าพยากรณ์จากแบบจำลอง\",\n  \"สภาพอากาศจริงอาจแตกต่างจากการคาดการณ์\"\n);\n\n// ==========================================\n// 12. Build Final Message\n// ==========================================\n\nconst message = lines.join(\"\\n\").trim();\n\nif (!message || message.length > 5000) {\n  throw new Error(\n    `Invalid message length: ${message.length}`\n  );\n}\n\n// ==========================================\n// 13. Output\n// ==========================================\n\nreturn [{\n  json: {\n\n    message,\n\n    messageLength: message.length,\n\n    locationCount: locations.length,\n\n    locationIds: locations.map(\n      data => data.locationId\n    ),\n\n    locations: locationResults,\n\n    hasAnyRainRisk,\n\n    processedAt:\n      locations[0].processedAt || null\n\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        -80
+      ],
+      "id": "250a100a-5e89-4105-b526-8d12604e4ca8",
+      "name": "Daily Summary Message"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "81cef48a-7657-45ef-aa09-f4d2f659ee8b",
+              "leftValue": "Expression: {{ $json.message }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "da19b5a4-0bd6-4ee8-be81-02586cf39ff3",
+              "leftValue": "={{ $json.locationCount }}",
+              "rightValue": 2,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "09fe7158-35f5-42d4-b115-56bbe1a58928",
+              "leftValue": "={{ $json.locationIds.includes('salaya')\n&& $json.locationIds.includes('nongkhaem') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        1712,
+        -80
+      ],
+      "id": "d0c12760-e001-471e-8895-53adc4f5dc58",
+      "name": "Check Message Ready"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.line.me/v2/bot/message/broadcast",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  JSON.stringify({\n    messages: [\n      {\n        type: \"text\",\n        text: $json.message\n      }\n    ]\n  })\n}}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1936,
+        -80
+      ],
+      "id": "b5eec6fd-970c-4267-ab8f-56c194819da1",
+      "name": "Send LINE Notification",
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -48,
+        -128
+      ],
+      "id": "e9de5aa0-56ef-4504-be75-bf1bfa0827e9",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// location หนองแขม,ศาลายา\nconst locations = [\n  {\n    locationId: \"salaya\",\n    locationName: \"ศาลายา\",\n    latitude: 13.803,\n    longitude: 100.321\n  },\n  {\n    locationId: \"nongkhaem\",\n    locationName: \"หนองแขม\",\n    latitude: 13.705,\n    longitude: 100.349\n  }\n];\n\nreturn locations.map(location => ({\n  json: location\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        -64
+      ],
+      "id": "0bb340c3-a973-4695-a4a1-4a465aa65f96",
+      "name": "Locations"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/*\n * Prepare Daily Forecast\n * Weather Alert Bot - Multi Location\n *\n * Purpose:\n * 1. Map Open-Meteo responses to their locations.\n * 2. Validate incoming weather data.\n * 3. Prepare hourly, current, and daily weather.\n * 4. Filter hourly forecast for today's date in Thailand.\n */\n\n// ==========================================\n// 1. Get Input Data\n// ==========================================\n\nconst weatherItems = $input.all();\nconst locationItems = $(\"Locations\").all();\n\nconst locations = locationItems.map(item => item.json);\n\n// ==========================================\n// 2. Validate Input Counts\n// ==========================================\n\nif (weatherItems.length === 0) {\n  throw new Error(\"No weather data received from HTTP Request\");\n}\n\nif (locations.length === 0) {\n  throw new Error(\"No location data received from Locations node\");\n}\n\nif (weatherItems.length !== locations.length) {\n  throw new Error(\n    `Weather/location count mismatch: ${weatherItems.length} weather items, ${locations.length} locations`\n  );\n}\n\n// ==========================================\n// 3. Validate Location Data\n// ==========================================\n\nconst locationIds = locations.map(location => location.locationId);\n\nif (locationIds.some(id => !id)) {\n  throw new Error(\"Missing locationId in Locations node\");\n}\n\nif (new Set(locationIds).size !== locationIds.length) {\n  throw new Error(\"Duplicate locationId detected\");\n}\n\nfor (const location of locations) {\n  if (\n    !location.locationName ||\n    !Number.isFinite(Number(location.latitude)) ||\n    !Number.isFinite(Number(location.longitude))\n  ) {\n    throw new Error(\n      `Invalid location configuration: ${location.locationId}`\n    );\n  }\n}\n\n// ==========================================\n// 4. Get Current Date in Thailand\n// ==========================================\n\nconst today = new Intl.DateTimeFormat(\"en-CA\", {\n  timeZone: \"Asia/Bangkok\",\n  year: \"numeric\",\n  month: \"2-digit\",\n  day: \"2-digit\"\n}).format(new Date());\n\n// ==========================================\n// 5. Validate and Prepare Each Location\n// ==========================================\n\nreturn weatherItems.map((item, index) => {\n\n  const data = item.json;\n  const location = locations[index];\n\n  // ----------------------------------------\n  // 5.1 Validate Location Mapping\n  // ----------------------------------------\n\n  if (!location) {\n    throw new Error(`Missing location for item ${index}`);\n  }\n\n  // ----------------------------------------\n  // 5.2 Validate API Response\n  // ----------------------------------------\n\n  if (!data || typeof data !== \"object\") {\n    throw new Error(\n      `Invalid API response for ${location.locationName}`\n    );\n  }\n\n  if (data.timezone !== \"Asia/Bangkok\") {\n    throw new Error(\n      `Incorrect timezone for ${location.locationName}: ${data.timezone}`\n    );\n  }\n\n  // ----------------------------------------\n  // 5.3 Validate Hourly Forecast\n  // ----------------------------------------\n\n  const hourly = data.hourly;\n\n  if (!hourly || !Array.isArray(hourly.time)) {\n    throw new Error(\n      `Invalid hourly forecast for ${location.locationName}`\n    );\n  }\n\n  const requiredFields = [\n    \"temperature_2m\",\n    \"precipitation_probability\",\n    \"precipitation\"\n  ];\n\n  for (const field of requiredFields) {\n\n    if (\n      !Array.isArray(hourly[field]) ||\n      hourly[field].length !== hourly.time.length\n    ) {\n      throw new Error(\n        `Invalid hourly field \"${field}\" for ${location.locationName}`\n      );\n    }\n  }\n\n  // ----------------------------------------\n  // 5.4 Prepare Today's Hourly Forecast\n  // ----------------------------------------\n\n  const todayForecast = [];\n\n  for (let i = 0; i < hourly.time.length; i++) {\n\n    const time = hourly.time[i];\n\n    if (typeof time !== \"string\") {\n      throw new Error(\n        `Invalid forecast time for ${location.locationName}`\n      );\n    }\n\n    // Keep only today's forecast in Thailand\n    if (!time.startsWith(today)) {\n      continue;\n    }\n\n    const temperature = hourly.temperature_2m[i];\n    const rainProbability = hourly.precipitation_probability[i];\n    const precipitation = hourly.precipitation[i];\n\n    // Validate numeric values\n    const validNumber = value =>\n      value !== null &&\n      value !== undefined &&\n      Number.isFinite(Number(value));\n\n    if (\n      !validNumber(temperature) ||\n      !validNumber(rainProbability) ||\n      !validNumber(precipitation)\n    ) {\n      throw new Error(\n        `Invalid hourly weather value at ${time} for ${location.locationName}`\n      );\n    }\n\n    // Validate rainfall probability\n    if (\n      Number(rainProbability) < 0 ||\n      Number(rainProbability) > 100\n    ) {\n      throw new Error(\n        `Invalid rain probability at ${time} for ${location.locationName}`\n      );\n    }\n\n    // Validate precipitation\n    if (Number(precipitation) < 0) {\n      throw new Error(\n        `Invalid precipitation at ${time} for ${location.locationName}`\n      );\n    }\n\n    todayForecast.push({\n      time,\n      temperature: Number(temperature),\n      rainProbability: Number(rainProbability),\n      precipitation: Number(precipitation)\n    });\n  }\n\n  // ----------------------------------------\n  // 5.5 Validate Today's Forecast\n  // ----------------------------------------\n\n  if (todayForecast.length === 0) {\n    throw new Error(\n      `No forecast data available for today: ${location.locationName}`\n    );\n  }\n\n  // ----------------------------------------\n  // 5.6 Prepare Current Weather\n  // ----------------------------------------\n\n  const currentWeather = {\n    time: data.current?.time ?? null,\n\n    temperature:\n      data.current?.temperature_2m ?? null,\n\n    feelsLike:\n      data.current?.apparent_temperature ?? null,\n\n    humidity:\n      data.current?.relative_humidity_2m ?? null\n  };\n\n  // ----------------------------------------\n  // 5.7 Prepare Daily Weather\n  // ----------------------------------------\n\n  const dailyWeather = {\n    maxTemperature:\n      data.daily?.temperature_2m_max?.[0] ?? null,\n\n    minTemperature:\n      data.daily?.temperature_2m_min?.[0] ?? null,\n\n    maxFeelsLike:\n      data.daily?.apparent_temperature_max?.[0] ?? null\n  };\n\n  // ----------------------------------------\n  // 5.8 Return Prepared Data\n  // ----------------------------------------\n\n  return {\n    json: {\n\n      locationId: location.locationId,\n      locationName: location.locationName,\n\n      latitude: Number(location.latitude),\n      longitude: Number(location.longitude),\n\n      date: today,\n\n      totalHours: todayForecast.length,\n\n      forecast: todayForecast,\n\n      currentWeather,\n\n      dailyWeather\n\n    }\n  };\n\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -64
+      ],
+      "id": "523e4c96-e3e9-4f4b-8722-55f06e812bf6",
+      "name": "Prepare Daily Forecast"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// วิเคราะห์อุณหภูมิและ Feels Like\nconst items = $input.all();\n\nreturn items.map((item, index) => {\n  const data = item.json;\n\n  // ตรวจสอบข้อมูลพยากรณ์รายชั่วโมง\n  const forecast = data.forecast || [];\n\n  const validHours = forecast.filter(hour =>\n    hour.time &&\n    hour.temperature !== null &&\n    Number.isFinite(Number(hour.temperature))\n  );\n\n  if (validHours.length === 0) {\n    throw new Error(\n      `No valid temperature data for ${data.locationName}`\n    );\n  }\n\n  // หาอุณหภูมิสูงสุดและต่ำสุดจาก Hourly Forecast\n  const maxHour = validHours.reduce((max, hour) =>\n    Number(hour.temperature) > Number(max.temperature)\n      ? hour\n      : max\n  );\n\n  const minHour = validHours.reduce((min, hour) =>\n    Number(hour.temperature) < Number(min.temperature)\n      ? hour\n      : min\n  );\n\n  // ข้อมูลสรุปประจำวันจาก Open-Meteo\n  const daily = data.dailyWeather || {};\n\n  const maxFeelsLike = daily.maxFeelsLike;\n\n  // ตรวจสอบความแตกต่างระหว่าง Daily API และ Hourly Forecast\n  const dailyMaxFromApi = daily.maxTemperature ?? null;\n  const dailyMinFromApi = daily.minTemperature ?? null;\n\n  const maxDifference = dailyMaxFromApi !== null\n    ? Number(\n        (\n          Number(maxHour.temperature) -\n          Number(dailyMaxFromApi)\n        ).toFixed(1)\n      )\n    : null;\n\n  return {\n    json: {\n      ...data,\n\n      dailyAnalysis: {\n        maxTemperature: Number(maxHour.temperature),\n        maxTemperatureTime: maxHour.time.slice(11, 16),\n\n        minTemperature: Number(minHour.temperature),\n        minTemperatureTime: minHour.time.slice(11, 16),\n\n        maxFeelsLike:\n          maxFeelsLike !== null &&\n          maxFeelsLike !== undefined\n            ? Number(maxFeelsLike)\n            : null,\n\n        dailyApiMaxTemperature: dailyMaxFromApi,\n        dailyApiMinTemperature: dailyMinFromApi,\n\n        hourlyVsDailyDifference: maxDifference\n      }\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -176
+      ],
+      "id": "108c5586-8ec5-4f22-9ec8-a5e003db45ab",
+      "name": "Analyze Daily Weather"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "fieldsToMatchString": "locationId",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1104,
+        -80
+      ],
+      "id": "4d94fbde-7f80-4701-8b14-8d575d804e5b",
+      "name": "Merge"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Locations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Prepare Daily Forecast",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Rain Risk": {
+      "main": [
+        [
+          {
+            "node": "Time Grouping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Time Grouping": {
+      "main": [
+        [
+          {
+            "node": "Rainfall Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rainfall Analysis": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Filter Upcoming Periods": {
+      "main": [
+        [
+          {
+            "node": "Daily Summary Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Summary Message": {
+      "main": [
+        [
+          {
+            "node": "Check Message Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Message Ready": {
+      "main": [
+        [
+          {
+            "node": "Send LINE Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Locations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Locations": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Daily Forecast": {
+      "main": [
+        [
+          {
+            "node": "Analyze Rain Risk",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Analyze Daily Weather",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Daily Weather": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Filter Upcoming Periods",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "Asia/Bangkok",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "tags": []
+}
